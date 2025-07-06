@@ -1,0 +1,10 @@
+flask
+flask-cors
+Pillow
+numpy
+tensorflow
+opencv-python
+face-recognition
+scikit-learn
+joblib
+uuid
