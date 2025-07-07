@@ -1,130 +1,212 @@
+import tensorflow as tf
 import numpy as np
-import cv2
+import sqlite3
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import joblib
 import os
-import face_recognition
-MAX_IMAGES = 6
 
-def preprocess_images(image):
-    """Preprocess a single image for model input."""
-    try:
-        image = cv2.imread(image)
-        if image is None:
-            raise ValueError("Image not found or could not be read.")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (224, 224))
-        image = image.astype(np.float32) / 255.0
-        return image
-    except Exception as e:
-        print(f"Error in preprocess_images: {e}")
-        return np.zeros((224, 224, 3))
-    
-def preprocess_images_folder(folder_path, max_images=MAX_IMAGES):
-    """Preprocess all images in a folder. If fewer than max_images, fill with zeros."""
-    images = []
-    images_file = []
-    for i in range(1, max_images + 1):
-        image_path = f"{folder_path}/image_{i}.jpg"
-        if os.path.exists(image_path):
-            images_file.append(image_path)
-            
-    for image_path in images_file:
-        img = preprocess_images(image_path)
-        images.append(img)
+class MultiImagePreferenceModel:
+    def __init__(self, max_images=6):
+        self.max_images = max_images
+        self.image_model = None
+        self.combined_model = None
+        self.scaler = StandardScaler()
         
-    while len(images) < max_images:
-        images.append(np.zeros((224, 224, 3)))
+    def build_image_model(self):
+        """
+        Build CNN for processing multiple images per profile
+        """
+        # Base model for single image
+        base_model = tf.keras.applications.MobileNetV2(
+            input_shape=(224, 224, 3),
+            include_top=False,
+            weights='imagenet'
+        )
+        base_model.trainable = False
         
-    images = images[:max_images]
-    return np.array(images)
-
-def extract_features(image_path):
-    """Extract facial features from a single image."""
-    try:
-        image = face_recognition.load_image_file(image_path)
-        face_encodings = face_recognition.face_encodings(image)
+        # Input for multiple images
+        multi_image_input = tf.keras.Input(shape=(self.max_images, 224, 224, 3))
         
-        if face_encodings:
-            return face_encodings[0]
-        else:
-            print(f"No face found in image: {image_path}")
-            return np.zeros(128)
-    except Exception as e:
-        print(f"Error in extract_feature: {e}")
-        return np.zeros(128)
+        # Process each image through the same base model
+        image_features = []
+        for i in range(self.max_images):
+            img = tf.keras.layers.Lambda(lambda x, idx=i: x[:, idx, :, :, :])(multi_image_input)
+            features = base_model(img, training=False)
+            features = tf.keras.layers.GlobalAveragePooling2D()(features)
+            image_features.append(features)
+        
+        # Stack features from all images
+        stacked_features = tf.keras.layers.Lambda(lambda x: tf.stack(x, axis=1))(image_features)
+        
+        # Use attention mechanism to weight different images
+        attention_weights = tf.keras.layers.Dense(1, activation='softmax')(stacked_features)
+        attention_weights = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=-1))(attention_weights)
+        
+        # Weighted average of image features
+        weighted_features = tf.keras.layers.Lambda(
+            lambda x: tf.reduce_sum(x[0] * tf.expand_dims(x[1], axis=-1), axis=1)
+        )([stacked_features, attention_weights])
+        
+        # Additional processing
+        x = tf.keras.layers.Dense(256, activation='relu')(weighted_features)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        final_image_features = tf.keras.layers.Dense(128, activation='relu')(x)
+        
+        self.image_model = tf.keras.Model(multi_image_input, final_image_features)
+        return self.image_model
     
-def extract_profile_features(folder_path, max_images=MAX_IMAGES):
-    """Extract features from all images in a profile folder."""
-    all_features = []
+    def build_combined_model(self):
+        """
+        Build combined model for multiple images + demographics + diversity metrics
+        """
+        # Multi-image input
+        image_input = tf.keras.Input(shape=(self.max_images, 224, 224, 3), name='images')
+        image_features = self.image_model(image_input)
+        
+        # Demographics input (age)
+        demo_input = tf.keras.Input(shape=(1,), name='demographics')
+        demo_features = tf.keras.layers.Dense(32, activation='relu')(demo_input)
+        
+        # Diversity metrics input
+        diversity_input = tf.keras.Input(shape=(4,), name='diversity')  # 4 diversity metrics
+        diversity_features = tf.keras.layers.Dense(16, activation='relu')(diversity_input)
+        
+        # Combine all features
+        combined = tf.keras.layers.concatenate([image_features, demo_features, diversity_features])
+        x = tf.keras.layers.Dense(128, activation='relu')(combined)
+        x = tf.keras.layers.Dropout(0.4)(x)
+        x = tf.keras.layers.Dense(64, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        x = tf.keras.layers.Dense(32, activation='relu')(x)
+        
+        # Output preference score
+        output = tf.keras.layers.Dense(1, activation='sigmoid', name='preference')(x)
+        
+        self.combined_model = tf.keras.Model(
+            inputs=[image_input, demo_input, diversity_input], 
+            outputs=output
+        )
+        
+        self.combined_model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy', 'mae']
+        )
+        
+        return self.combined_model
     
-    for i in range(1, max_images + 1):
-        image_path = f"{folder_path}/image_{i}.jpg"
-        if os.path.exists(image_path):
-            features = extract_features(image_path)
-            if features is not None and np.any(features):
-                all_features.append(features)
-
-    if not all_features:
-        print(f"No valid images found in folder: {folder_path}")
-        return np.zeros(128)
-    
-    return np.mean(all_features, axis=0)
-
-def analyze_profile_diversity(profile_folder, max_images=MAX_IMAGES):
-    """
-    Analyze diversity of images in a profile
-    Returns metrics about pose variety, lighting, etc.
-    """
-    diversity_metrics = {
-        'num_faces_detected': 0,
-        'pose_variety': 0.0,
-        'lighting_variety': 0.0,
-        'image_quality': 0.0
-    }
-    
-    face_landmarks_list = []
-    brightness_values = []
-    
-    for i in range(1, max_images + 1):  # Check up to 6 images
-        image_path = f'{profile_folder}/image_{i}.jpg'
-        if os.path.exists(image_path):
+    def load_training_data(self):
+        """
+        Load profile data from database for training
+        """
+        conn = sqlite3.connect('data/swipes.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT profile_folder, age, preference_score FROM profiles')
+        data = cursor.fetchall()
+        conn.close()
+        
+        if len(data) < 20:
+            raise ValueError("Not enough training data. Need at least 20 profiles.")
+        
+        from utils.image_processing import preprocess_profile_images, analyze_profile_diversity
+        
+        images = []
+        ages = []
+        diversity_metrics = []
+        scores = []
+        
+        for profile_folder, age, score in data:
             try:
-                # Load image
-                image = face_recognition.load_image_file(image_path)
+                # Load and preprocess multiple images
+                profile_images = preprocess_profile_images(profile_folder, self.max_images)
                 
-                # Detect faces
-                face_landmarks = face_recognition.face_landmarks(image)
-                if face_landmarks:
-                    diversity_metrics['num_faces_detected'] += 1
-                    face_landmarks_list.append(face_landmarks[0])
+                # Get diversity metrics
+                diversity = analyze_profile_diversity(profile_folder)
+                diversity_vector = [
+                    diversity['num_faces_detected'],
+                    diversity['pose_variety'],
+                    diversity['lighting_variety'],
+                    diversity['image_quality']
+                ]
                 
-                # Analyze brightness
-                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-                brightness = np.mean(gray)
-                brightness_values.append(brightness)
+                images.append(profile_images)
+                ages.append(age)
+                diversity_metrics.append(diversity_vector)
+                scores.append(score)
                 
             except Exception as e:
-                print(f"Error analyzing {image_path}: {e}")
-    
-    # Calculate pose variety (variation in facial landmarks)
-    if len(face_landmarks_list) > 1:
-        pose_variations = []
-        for i in range(len(face_landmarks_list)):
-            for j in range(i+1, len(face_landmarks_list)):
-                # Compare nose tip positions as proxy for pose
-                nose1 = np.mean(face_landmarks_list[i].get('nose_tip', [[0,0]]), axis=0)
-                nose2 = np.mean(face_landmarks_list[j].get('nose_tip', [[0,0]]), axis=0)
-                variation = np.linalg.norm(nose1 - nose2)
-                pose_variations.append(variation)
+                print(f"Error loading {profile_folder}: {e}")
+                continue
         
-        diversity_metrics['pose_variety'] = np.mean(pose_variations) if pose_variations else 0.0
+        return (np.array(images), np.array(ages), 
+                np.array(diversity_metrics), np.array(scores))
     
-    # Calculate lighting variety
-    if len(brightness_values) > 1:
-        diversity_metrics['lighting_variety'] = np.std(brightness_values)
+    def train(self):
+        """
+        Train the multi-image preference model
+        """
+        # Load data
+        images, ages, diversity_metrics, scores = self.load_training_data()
+        
+        # Normalize inputs
+        ages_scaled = self.scaler.fit_transform(ages.reshape(-1, 1)).flatten()
+        diversity_scaled = self.scaler.fit_transform(diversity_metrics)
+        
+        # Split data
+        (X_img_train, X_img_test, X_age_train, X_age_test, 
+         X_div_train, X_div_test, y_train, y_test) = train_test_split(
+            images, ages_scaled, diversity_scaled, scores, 
+            test_size=0.2, random_state=42
+        )
+        
+        # Build models
+        self.build_image_model()
+        self.build_combined_model()
+        
+        # Train with early stopping
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True
+        )
+        
+        history = self.combined_model.fit(
+            [X_img_train, X_age_train, X_div_train],
+            y_train,
+            validation_data=([X_img_test, X_age_test, X_div_test], y_test),
+            epochs=100,
+            batch_size=8,
+            callbacks=[early_stopping],
+            verbose=1
+        )
+        
+        # Save models
+        os.makedirs('models', exist_ok=True)
+        self.combined_model.save('models/multi_image_preference_model.h5')
+        joblib.dump(self.scaler, 'models/scaler.pkl')
+        
+        return history
     
-    # Overall image quality (based on number of faces detected)
-    total_images = len([f for f in os.listdir(profile_folder) if f.endswith('.jpg')])
-    if total_images > 0:
-        diversity_metrics['image_quality'] = diversity_metrics['num_faces_detected'] / total_images
+    def predict(self, images, age, diversity_metrics):
+        """
+        Predict preference score for new profile with multiple images
+        """
+        if self.combined_model is None:
+            self.load_model()
+        
+        # Preprocess inputs
+        images = np.expand_dims(images, axis=0)
+        age_scaled = self.scaler.transform([[age]])
+        diversity_scaled = self.scaler.transform([diversity_metrics])
+        
+        # Predict
+        prediction = self.combined_model.predict([images, age_scaled, diversity_scaled])
+        return float(prediction[0][0])
     
-    return diversity_metrics
+    def load_model(self):
+        """Load trained model"""
+        try:
+            self.combined_model = tf.keras.models.load_model('models/multi_image_preference_model.h5')
+            self.scaler = joblib.load('models/scaler.pkl')
+        except:
+            raise ValueError("No trained model found. Please train first.")

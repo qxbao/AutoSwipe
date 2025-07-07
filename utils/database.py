@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import base64
 
 DB_PATH = os.path.dirname(__file__) + '/../data/swipes.db'
 
@@ -25,16 +26,22 @@ class Database:
     @staticmethod
     def save_profile_folder(profile_id, images) -> str:
         profile_folder = os.path.join(os.path.dirname(__file__), '../data/images', profile_id)
+        
         if not os.path.exists(profile_folder):
             os.makedirs(profile_folder)
         for i, image in enumerate(images):
+            if "data:image" in image:
+                image = image.split(",")[1]
+            decoded_image_data = base64.b64decode(image)
             image_path = os.path.join(profile_folder, f'image_{i}.jpg')
-            with open(image_path, 'wb') as img_file:
-                img_file.write(image)
+            with open(image_path, 'wb') as f:
+                f.write(decoded_image_data)
         return profile_folder
     
     @staticmethod
     def init_db() -> None:
+        if not os.path.exists(DB_PATH):
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''

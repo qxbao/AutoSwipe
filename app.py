@@ -34,6 +34,25 @@ def record_swipe():
     except Exception as e:
         return jsonify({"status": "Error", "message": str(e)}), 500
 
+@app.route('/predict', methods=['POST'])
+def predict_preference():
+    try:
+        body = request.json
+        images = body.get('images', [])
+        age = body.get('age')
+        if not images or age is None:
+            return jsonify({"status": "Error", "message": "No images or age provided"}), 400
+        
+        from utils.predict_utils import predict_profile_score
+        score = predict_profile_score(images, age)
+        
+        return jsonify({
+            "status": "Success",
+            "score": score
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "Error", "message": str(e)}), 500
+
 if __name__ == '__main__':
     Database.init_db()
     app.run(debug=True, port=5000)
